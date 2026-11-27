@@ -1,44 +1,53 @@
-// Dip Hunter strategy — pump.fun replay bot (agent-fun/replay/v2).
+// Flow Scalper — pump.fun replay bot v2 (agent-fun/replay/v2).
 //
-// Final entry (chosen after 9 sweep stages, ~50 configs, on the real engine):
-//   buy the 25% retracement of a coin that already proved real demand
-//   (real SOL >= 10), at most 0.20 SOL (the 1% reserve cap binds first at
-//   0.10 SOL), one buy per coin; exit at +25% take-profit, -10% trailing
-//   stop, -5% hard stop, or 600 s max hold, whichever comes first.
+// A complete rewrite of the v1 "Dip Hunter" entry (dev PnL -0.298 SOL,
+// round 2 rank 1512/2047). The v1 lesson, now recorded: a strategy whose
+// dev backtest is negative cannot win on a replay drawn from the same
+// distribution — the backtest IS the result (round 2 score -0.298 SOL was
+// the dev number to the lamport). So v2 is built around the one
+// positive-expectation shape measured on this same dev window: a
+// tape-filtered scalper that waits for proof of real demand and then buys
+// a steady rise, not a pop and not a dip.
 //
-// Design notes (from the dev dataset + the real engine's fill mechanics):
-//   * A buy decided on slot s fills at slot s+2, and the price the bot sees
-//     is already the post-trade price of slot s. Measured on the dev window,
-//     the median fill lands +15.5% above the price of the trade that first
-//     made a coin buyable — the early "pop" is mostly over by the fill. Any
-//     entry that chases the first pop buys the top. That killed 'early'
-//     (-3.49 SOL), 'established' (-2.08), 'milestone' (-2.32) and
-//     'whale'-following (-0.50) in the real engine.
-//   * The dip entry survives because a retracement is a LEVEL, not a fast
-//     move: the price stays in the dip zone, so the fill price ~ trigger
-//     price (median fill/trigger 1.00x). Dips still drift down more often
-//     than they bounce (median max loss after entry -51% vs median max gain
-//     +16%), which is why the exits are tight: a -5% hard stop cuts the
-//     falling knife early, a +25% take-profit banks the bounce when it comes,
-//     and a 600 s max hold frees the 5 position slots.
-//   * Completions are whale-driven and instantaneous (median largest single
-//     buy 37 SOL; time from real SOL 40 to completion p50 = 0 s): not a
-//     rideable edge, so the strategy never waits for graduation. The
-//     'scout' variant (buy dust at creation, top up on proof) also lost
-//     (-2.71..-6.35) — the tiny stakes pay the tx fee many times over and
-//     the top-ups land at bad prices.
-//   * The mean final multiple from trade #1 is +25%, but it is entirely
-//     consumed by entering after the pop plus the fill lag; the realized
-//     per-trip edge of the best family is ~-0.002 SOL (fees ~0.0018 + adverse
-//     price ~0.0016). No tested family is positive on the dev window.
-//   * With only 5 position slots, every position is time-boxed (600 s) so
-//     quiet coins cannot clog a slot. The dip family makes ~119 trips over
-//     24 h, i.e. ~30 over the final 6 h window — comfortably above the
-//     20-coin guardrail; the more selective dip R20 (59 trips) would risk
-//     failing it and was rejected for that reason.
-//   * Deterministic: no clock, no randomness, no environment reads. The only
-//     time source is the events' own timestamps. Two runs produce identical
-//     action logs.
+// Why this shape — the measurements behind it (dev window, official
+// grade-local unless noted):
+//   * The 2-slot fill lag kills momentum entries. A buy decided on slot s
+//     fills at s+2 at the post-trade price of slot s. On a fast pop the
+//     median fill lands +15.5% above the trigger trade's price; the pop is
+//     over by the fill. v1's pop-chasing families lost -2.08..-3.49 SOL.
+//   * A dip is a level, so its fill lands at the trigger price — but dips
+//     drift down more often than they bounce (median max loss after entry
+//     -51% vs median max gain +16%), which is why v1's dip family still
+//     lost -0.298 SOL at a 24.6% win rate.
+//   * The tape filter is the discriminator. The sibling Sharpe bot
+//     ("Steady Scalper", same dev data) was the ONLY bot of five measured
+//     with a positive dev PnL (+0.010 SOL, 76 trips, 32.9% win rate,
+//     max DD 1.3%): it buys only coins whose last ~60 slots show real
+//     demand (net SOL inflow, several distinct buyers, price rising
+//     steadily and still near its window high, no big sell, creator
+//     hasn't sold). A steady rise over 60 slots moves ~0.2% in the 2
+//     fill-lag slots, so the lag costs almost nothing — unlike a pop.
+//   * The fee wedge is the central headwind: ~95+30 bps curve fees per
+//     trade plus a fixed 0.000105 SOL tx fee per order. A 0.05 SOL round
+//     trip pays ~2.5% in fees. So exits are PRICE-based (vs entry price),
+//     not value-based: a -8% value stop is only a -5.5% price stop once
+//     fees are counted, while a +80% value target needs a +84% price
+//     move. Price-based exits keep the risk/reward honest.
+//   * The payoff is deliberately skewed: most pump.fun coins dump, so the
+//     bot pays many small -8% losses to stay alive for the occasional
+//     runner, and the trailing stop banks partial gains on coins that run
+//     +20-40% and fade. Buys refuse a fill whose price jumped >15% in
+//     the 2-slot latency (1500 bps slippage); sells always execute
+//     (10000 bps) so exits never strand a position.
+//   * Guardrail insurance: the final window is 6 h (~300 mints) while dev
+//     is 24 h (~1222 mints). A strict filter that makes 76 trips/24 h
+//     makes only ~19 in 6 h — right at the 20-coin guardrail. So a pace
+//     fallback loosens the filter one tier whenever filled coins lag the
+//     pace (20 coins per 30,000 elapsed slots). The fallback is
+//     load-bearing, not decorative.
+//   * Deterministic: no clock, no randomness, no environment reads. The
+//     only time source is the batch slot numbers. Two runs produce
+//     identical action logs.
 
 import {
   LAMPORTS_PER_SOL,
@@ -48,71 +57,123 @@ import {
 } from './vendor/makefun-bot.ts';
 
 export interface Params {
-  /** Entry rule. */
-  entry: 'early' | 'established' | 'dip' | 'milestone' | 'dip-confirm' | 'whale' | 'scout';
-  /** 'whale': a single buy trade of at least this many lamports triggers a buy. */
-  whaleMinLamports: bigint;
-  /** 'scout': first buy when the cap reaches this (lamports); topped up to targetLamports at realSolMinLamports. */
-  scoutMinLamports: bigint;
-  /** 'established'/'dip'/'milestone'/'dip-confirm': minimum real SOL (lamports) before a buy. */
+  /** Rolling tape window, in slots (~0.4 s each). */
+  windowSlots: number;
+  /** Coin age at entry, in slots since its CreateEvent. */
+  minAgeSlots: number;
+  maxAgeSlots: number;
+  /** Real SOL reserve range at entry (lamports). */
   realSolMinLamports: bigint;
-  /** 'established': price must be up this much vs first-seen (bps). */
-  riseBps: number;
-  /** 'dip'/'dip-confirm': price must have retraced this much from its peak (bps). */
-  dipBps: number;
-  /** 'dip-confirm': price must have bounced this much off its post-peak trough (bps). */
-  confirmBps: number;
-  /** Max stake per coin (lamports); the 1% reserve cap usually binds first. */
-  targetLamports: bigint;
-  /** Fixed take-profit vs entry price (bps), or null for none. */
-  tpBps: number | null;
-  /** Trailing stop vs peak since entry (bps), or null for none. */
-  trailBps: number | null;
+  realSolMaxLamports: bigint;
+  /** Tape filter (strict tier): minimum net SOL inflow over the window. */
+  inflowMinLamports: bigint;
+  /** Tape filter: minimum buy trades / distinct buyers over the window. */
+  buyMin: number;
+  buyerMin: number;
+  /** Tape filter: price rise over the window, in bps (min..max). */
+  riseMinBps: number;
+  riseMaxBps: number;
+  /** Tape filter: current price must be at least this share of the window high (bps). */
+  highBps: number;
+  /** Tape filter: no single sell of at least this many lamports in the window. */
+  maxSellLamports: bigint;
+  /** Stake per position (lamports); the 1% reserve cap usually binds first on small coins. */
+  stakeLamports: bigint;
+  /** Take-profit vs entry price (bps). */
+  tpBps: number;
   /** Hard stop vs entry price (bps). */
   stopBps: number;
-  /** Max hold in event-time seconds, or null for none. */
-  maxHoldSec: number | null;
-  /** Sell when the coin has had no trade for this many event-time seconds (null: off). */
-  idleSec: number | null;
+  /** Trailing stop: arms at this rise vs entry (bps), exits on this pullback from peak (bps). */
+  trailArmBps: number;
+  trailBps: number;
+  /** Max hold in slots, or null for none. */
+  maxHoldSlots: number | null;
+  /** Buy slippage cap (bps); sells always use 10000. */
+  buySlippageBps: number;
+  // --- pace-fallback (loose) tier: used while filled coins lag the pace ---
+  /** Loose tier: minimum net SOL inflow over the window. */
+  looseInflowMinLamports: bigint;
+  /** Loose tier: minimum buy trades / distinct buyers. */
+  looseBuyMin: number;
+  looseBuyerMin: number;
+  /** Loose tier: minimum price rise over the window (bps). */
+  looseRiseMinBps: number;
+  /** Loose tier: minimum real SOL reserve (lamports). */
+  looseRealSolMinLamports: bigint;
+  /** Loose tier: maximum coin age in slots. */
+  looseMaxAgeSlots: number;
+  /** Loose tier: stake per position (lamports). */
+  looseStakeLamports: bigint;
+  /** Pace: this many filled coins per this many elapsed slots. */
+  paceCoins: number;
+  paceSlots: number;
+  /** Pace fallback only starts after this many elapsed slots. */
+  paceStartSlots: number;
+  /** Pace fallback fires when filled coins are this many below the target. */
+  paceSlack: number;
+  /** When true, a creator sell at ANY time disqualifies the coin; when false,
+   *  only a creator sell inside the tape window does. */
+  creatorSoldLifetime: boolean;
 }
 
 export const DEFAULT_PARAMS: Params = {
-  entry: 'dip',
-  realSolMinLamports: 10n * LAMPORTS_PER_SOL,
-  whaleMinLamports: 5n * LAMPORTS_PER_SOL,
-  scoutMinLamports: LAMPORTS_PER_SOL / 1000n, // 0.001 SOL: first dust the cap allows
-  riseBps: 3000, // +30% vs first-seen price
-  dipBps: 2500, // -25% from peak
-  confirmBps: 500, // +5% off the post-peak trough
-  targetLamports: LAMPORTS_PER_SOL / 5n, // 0.20 SOL
-  tpBps: 2500, // +25%
-  trailBps: 1000, // -10% from peak
-  stopBps: 500, // -5% from entry: cut losers fast (sweep: stop2-5% is the flat best region)
-  maxHoldSec: 600,
-  idleSec: null, // idle exit is for the ride-the-tail family, not the dip
+  windowSlots: 60,
+  minAgeSlots: 120,
+  maxAgeSlots: 2400,
+  realSolMinLamports: 5000000000n,
+  realSolMaxLamports: 80000000000n,
+  inflowMinLamports: 300000000n,
+  buyMin: 4,
+  buyerMin: 5,
+  riseMinBps: 500,
+  riseMaxBps: 6000,
+  highBps: 9800,
+  maxSellLamports: 500000000n,
+  stakeLamports: 30000000n,
+  tpBps: 8000,
+  stopBps: 500,
+  trailArmBps: 1500,
+  trailBps: 500,
+  maxHoldSlots: 900,
+  buySlippageBps: 1500,
+  looseInflowMinLamports: 100000000n,
+  looseBuyMin: 3,
+  looseBuyerMin: 3,
+  looseRiseMinBps: 100,
+  looseRealSolMinLamports: 3000000000n,
+  looseMaxAgeSlots: 3600,
+  looseStakeLamports: 50000000n,
+  paceCoins: 20,
+  paceSlots: 30000,
+  paceStartSlots: 5000,
+  paceSlack: 2,
+  creatorSoldLifetime: true,
 };
 
 export const MIN_BUY_LAMPORTS = LAMPORTS_PER_SOL / 100n; // 0.01 SOL
-export const SCOUT_SIZE_LAMPORTS = LAMPORTS_PER_SOL / 100n; // 0.01 SOL scout stake
-export const MAX_SLIPPAGE_BPS = 10_000; // fill at market; 2-slot latency moves price little
+export const SELL_SLIPPAGE_BPS = 10_000; // sells always execute
+
+interface TapeTrade {
+  slot: number;
+  price: number;
+  isBuy: boolean;
+  solLamports: bigint;
+  user: string;
+  creator: string;
+}
+
+interface CoinTape {
+  createdSlot: number | null;
+  creator: string | null;
+  /** A sell by the creator at any time (never reset). */
+  creatorSoldEver: boolean;
+  trades: TapeTrade[];
+}
 
 interface Tracked {
   entryPrice: number;
   peak: number;
-  entryTime: number;
-  lastMark: number;
-  /** Event-time seconds of this coin's latest trade (for the idle exit). */
-  lastTradeTime: number;
-}
-
-interface CoinInfo {
-  firstPrice: number;
-  peak: number;
-  firstSeenTime: number;
-  /** Lowest mark since the peak was set (for dip-confirm). */
-  trough: number;
-  /** A single buy trade >= whaleMinLamports was seen on this coin. */
-  whale: boolean;
+  entrySlot: number;
 }
 
 function markPrice(state: BotState, mint: string): number | null {
@@ -122,36 +183,72 @@ function markPrice(state: BotState, mint: string): number | null {
   return Number(c.virtual_quote_reserves) / Number(c.virtual_token_reserves);
 }
 
+function tradePrice(e: { virtual_quote_reserves: string; virtual_token_reserves: string }): number | null {
+  const vt = BigInt(e.virtual_token_reserves);
+  if (vt === 0n) return null;
+  return Number(BigInt(e.virtual_quote_reserves)) / Number(vt);
+}
+
 /** A fresh, stateful bot: one instance per run (never share across runs). */
 export function createBot(p: Params = DEFAULT_PARAMS) {
   const tracked = new Map<string, Tracked>();
   const bought = new Set<string>();
-  const candidates = new Map<string, CoinInfo>();
-  /** Lamports already spent per mint (scout + top-up accounting). */
-  const spent = new Map<string, bigint>();
-  let nowSec = 0;
+  const tapes = new Map<string, CoinTape>();
+  let startSlot = -1;
+  let filledCoins = 0;
 
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
       const orders: OrderInput[] = [];
       const txFee = state.txFeeLamports();
+      if (startSlot < 0) startSlot = state.slot;
 
+      // Ingest this batch's events into the per-coin tapes.
       for (const e of batch.events) {
-        const t = Number(e.timestamp);
-        if (Number.isFinite(t) && t > nowSec) nowSec = t;
-        if (e.event === 'TradeEvent') {
-          const tr = tracked.get(e.mint);
-          if (tr !== undefined && Number.isFinite(t)) tr.lastTradeTime = Math.max(tr.lastTradeTime, t);
+        if (e.event === 'CompleteEvent') {
+          tapes.delete(e.mint);
+          continue;
         }
+        if (e.event === 'CreateEvent') {
+          const t = tapes.get(e.mint) ?? { createdSlot: null, creator: null, creatorSoldEver: false, trades: [] };
+          t.createdSlot = e.slot;
+          t.creator = e.creator;
+          tapes.set(e.mint, t);
+          continue;
+        }
+        if (e.event !== 'TradeEvent') continue;
+        // Record the trade at the batch-end mark (the curve price after the
+        // whole batch is applied), not the trade's own post-trade price:
+        // the window stats (rise, high) are computed on marks, and a
+        // batch-end mark is what the decision-time price actually is.
+        const price = markPrice(state, e.mint) ?? tradePrice(e);
+        if (price === null) continue;
+        let t = tapes.get(e.mint);
+        if (t === undefined) {
+          t = { createdSlot: null, creator: null, creatorSoldEver: false, trades: [] };
+          tapes.set(e.mint, t);
+        }
+        if (t.creator === null) t.creator = e.creator;
+        if (!e.is_buy && e.user === e.creator) t.creatorSoldEver = true;
+        t.trades.push({
+          slot: e.slot,
+          price,
+          isBuy: e.is_buy,
+          solLamports: BigInt(e.sol_amount),
+          user: e.user,
+          creator: e.creator,
+        });
       }
 
+      // Fills: track positions and count filled coins (pace).
       for (const f of batch.fills) {
         if (f.side === 'buy' && f.status === 'filled') {
           const tokens = BigInt(f.token_amount);
           const quote = BigInt(f.quote_lamports);
           if (tokens > 0n && !tracked.has(f.mint)) {
             const price = Number(quote) / Number(tokens);
-            tracked.set(f.mint, { entryPrice: price, peak: price, entryTime: nowSec, lastMark: price, lastTradeTime: nowSec });
+            tracked.set(f.mint, { entryPrice: price, peak: price, entrySlot: state.slot });
+            filledCoins += 1;
           }
           bought.add(f.mint);
         } else if (f.side === 'sell' && f.status === 'filled') {
@@ -165,12 +262,12 @@ export function createBot(p: Params = DEFAULT_PARAMS) {
         if (!tracked.has(mint)) {
           const mark = markPrice(state, mint);
           const price = mark ?? Number(holding.cost_lamports) / Math.max(1, Number(holding.token_amount));
-          tracked.set(mint, { entryPrice: price, peak: price, entryTime: nowSec, lastMark: price, lastTradeTime: nowSec });
+          tracked.set(mint, { entryPrice: price, peak: price, entrySlot: state.slot });
           bought.add(mint);
         }
       }
 
-      // Exits.
+      // Exits (price-based, vs entry price).
       for (const [mint, holding] of state.positions) {
         const tr = tracked.get(mint);
         if (tr === undefined) continue;
@@ -184,122 +281,117 @@ export function createBot(p: Params = DEFAULT_PARAMS) {
         if (sellPending) continue;
         const mark = markPrice(state, mint);
         if (mark === null) continue;
-        tr.lastMark = mark;
         if (mark > tr.peak) tr.peak = mark;
-        const tpHit = p.tpBps !== null && mark * 10_000 >= tr.entryPrice * (10_000 + p.tpBps);
-        const trailHit = p.trailBps !== null && mark * 10_000 <= tr.peak * (10_000 - p.trailBps);
+        const tpHit = mark * 10_000 >= tr.entryPrice * (10_000 + p.tpBps);
+        const trailHit =
+          tr.peak * 10_000 >= tr.entryPrice * (10_000 + p.trailArmBps) &&
+          mark * 10_000 <= tr.peak * (10_000 - p.trailBps);
         const stopHit = mark * 10_000 <= tr.entryPrice * (10_000 - p.stopBps);
-        const holdHit = p.maxHoldSec !== null && nowSec - tr.entryTime >= p.maxHoldSec;
-        const idleHit = p.idleSec !== null && nowSec - tr.lastTradeTime >= p.idleSec;
-        if (tpHit || trailHit || stopHit || holdHit || idleHit) {
-          orders.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: MAX_SLIPPAGE_BPS });
+        const holdHit = p.maxHoldSlots !== null && state.slot - tr.entrySlot >= p.maxHoldSlots;
+        if (tpHit || trailHit || stopHit || holdHit) {
+          orders.push({ side: 'sell', mint, token_amount: holding.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
         }
       }
 
-      // Entries.
+      // Pace: are filled coins behind the linear pace target?
+      const elapsed = Math.max(0, state.slot - startSlot);
+      const paceTarget = (p.paceCoins * elapsed) / p.paceSlots;
+      const loose = elapsed >= p.paceStartSlots && filledCoins < paceTarget - p.paceSlack;
+      // Entries: evaluate coins that traded in this batch.
+      const seenThisBatch = new Set<string>();
       for (const e of batch.events) {
-        if (e.event === 'CompleteEvent') {
-          candidates.delete(e.mint);
-          continue;
-        }
-        if (!bought.has(e.mint) && !candidates.has(e.mint)) {
-          const mark = markPrice(state, e.mint);
-          if (mark !== null) candidates.set(e.mint, { firstPrice: mark, peak: mark, firstSeenTime: nowSec, trough: mark, whale: false });
-        }
-        // Whale trigger: one big buy trade on this coin.
-        if (e.event === 'TradeEvent' && e.is_buy) {
-          const info = candidates.get(e.mint);
-          if (info !== undefined && BigInt(e.sol_amount) >= p.whaleMinLamports) info.whale = true;
-        }
-      }
-      // Refresh peaks/troughs for candidates from current marks.
-      for (const [mint, info] of candidates) {
-        const mark = markPrice(state, mint);
-        if (mark === null) continue;
-        if (mark > info.peak) {
-          info.peak = mark;
-          info.trough = mark; // a new peak resets the trough
-        } else if (mark < info.trough) {
-          info.trough = mark;
-        }
+        if (e.event === 'CompleteEvent') continue;
+        seenThisBatch.add(e.mint);
       }
       let slots = state.hello.caps.max_open_positions - state.committedPositionCount();
       let free = state.freeCashLamports();
-      for (const [mint, info] of [...candidates]) {
+      const cutoff = state.slot - p.windowSlots;
+      for (const mint of seenThisBatch) {
         if (slots <= 0) break;
         if (orders.length >= state.hello.caps.max_orders_per_batch) break;
+        if (bought.has(mint)) continue;
         const curve = state.curves.get(mint);
-        if (curve === undefined || curve.complete) {
-          candidates.delete(mint);
-          continue;
+        if (curve === undefined || curve.complete) continue;
+        const tape = tapes.get(mint);
+        if (tape === undefined) continue;
+        // Prune the tape to the window (in place; trades arrive in slot order).
+        while (tape.trades.length > 0 && tape.trades[0]!.slot <= cutoff) tape.trades.shift();
+        if (tape.trades.length === 0) continue;
+        const age = tape.createdSlot === null ? Number.MAX_SAFE_INTEGER : state.slot - tape.createdSlot;
+        const realSol = curve.real_quote_reserves;
+        // Tape stats over the window.
+        let inflow = 0n;
+        let buys = 0;
+        let maxSell = 0n;
+        let creatorSoldWindow = false;
+        const buyers = new Set<string>();
+        let high = tape.trades[0]!.price;
+        for (const tr of tape.trades) {
+          if (tr.isBuy) {
+            inflow += tr.solLamports;
+            buys += 1;
+            buyers.add(tr.user);
+          } else {
+            inflow -= tr.solLamports;
+            if (tr.solLamports > maxSell) maxSell = tr.solLamports;
+            if (tape.creator !== null && tr.user === tape.creator) creatorSoldWindow = true;
+          }
+          if (tr.price > high) high = tr.price;
         }
-        const cap = state.maxBuyLamports(mint);
-        const minCap = p.entry === 'scout' ? p.scoutMinLamports : MIN_BUY_LAMPORTS;
-        if (cap < minCap) continue; // not buyable yet; keep waiting
+        const creatorSold = p.creatorSoldLifetime ? tape.creatorSoldEver : creatorSoldWindow;
         const mark = markPrice(state, mint);
         if (mark === null) continue;
-        let ok = false;
-        if (p.entry === 'early') {
-          ok = true;
-        } else if (p.entry === 'established') {
-          ok = curve.real_quote_reserves >= p.realSolMinLamports && mark * 10_000 >= info.firstPrice * (10_000 + p.riseBps);
-        } else if (p.entry === 'milestone') {
-          // Buy the moment the coin first proves real demand (real SOL >= R):
-          // the rise is implied (price ~ (1 + R/30)^2 vs creation) and the
-          // entry is not delayed by an extra rise filter.
-          ok = curve.real_quote_reserves >= p.realSolMinLamports;
-        } else if (p.entry === 'dip') {
-          // Dip: retraced from its peak, still above first-seen, real activity present.
-          ok =
-            curve.real_quote_reserves >= p.realSolMinLamports &&
-            mark * 10_000 <= info.peak * (10_000 - p.dipBps) &&
-            mark >= info.firstPrice;
-        } else if (p.entry === 'dip-confirm') {
-          // dip-confirm: as dip, plus the price has bounced off its post-peak trough.
-          ok =
-            curve.real_quote_reserves >= p.realSolMinLamports &&
-            mark * 10_000 <= info.peak * (10_000 - p.dipBps) &&
-            mark >= info.firstPrice &&
-            mark * 10_000 >= info.trough * (10_000 + p.confirmBps);
-        } else if (p.entry === 'whale') {
-          // whale: a single big buy was seen; ride the wave that follows it.
-          ok = info.whale;
-        } else {
-          // scout: buy the first dust the cap allows (near creation price,
-          // while the coin is quiet and the fill lag is small), then top up
-          // once to the target when real SOL proves demand.
-          const already = spent.get(mint) ?? 0n;
-          if (already === 0n) {
-            ok = cap >= p.scoutMinLamports;
-          } else {
-            ok = curve.real_quote_reserves >= p.realSolMinLamports && already < p.targetLamports;
-          }
-        }
-        if (!ok) continue;
-        const already = spent.get(mint) ?? 0n;
-        let amount: bigint;
-        let isNewSlot: boolean;
-        if (p.entry === 'scout' && already === 0n) {
-          // First dust: at most the scout size, however big the cap already is.
-          amount = cap < SCOUT_SIZE_LAMPORTS ? cap : SCOUT_SIZE_LAMPORTS;
-          isNewSlot = true;
-        } else if (p.entry === 'scout') {
-          amount = cap < p.targetLamports - already ? cap : p.targetLamports - already;
-          isNewSlot = false; // topping up a slot we already hold
-        } else {
-          amount = cap < p.targetLamports ? cap : p.targetLamports;
-          isNewSlot = true;
-        }
+        // Price rise over the window, vs the oldest tape price still in it.
+        const base = tape.trades[0]!.price;
+        const riseBps = ((mark - base) / base) * 10_000;
+        const nearHigh = mark * 10_000 >= high * p.highBps;
+        // Strict tier first, loose tier second — exactly the reference
+        // shape: a coin that passes the strict filter always buys at the
+        // strict stake, even while the pace fallback is active. (Applying
+        // the loose stake to strict-quality coins over-sizes the best
+        // entries and was a real deviation from the reference.)
+        const passesStrict =
+          age >= p.minAgeSlots &&
+          age <= p.maxAgeSlots &&
+          realSol >= p.realSolMinLamports &&
+          realSol <= p.realSolMaxLamports &&
+          inflow >= p.inflowMinLamports &&
+          buys >= p.buyMin &&
+          buyers.size >= p.buyerMin &&
+          riseBps >= p.riseMinBps &&
+          riseBps <= p.riseMaxBps &&
+          nearHigh &&
+          maxSell < p.maxSellLamports &&
+          !creatorSold;
+        const passesLoose =
+          age >= p.minAgeSlots &&
+          age <= p.looseMaxAgeSlots &&
+          realSol >= p.looseRealSolMinLamports &&
+          realSol <= p.realSolMaxLamports &&
+          inflow >= p.looseInflowMinLamports &&
+          buys >= p.looseBuyMin &&
+          buyers.size >= p.looseBuyerMin &&
+          riseBps >= p.looseRiseMinBps &&
+          riseBps <= p.riseMaxBps &&
+          nearHigh &&
+          maxSell < p.maxSellLamports &&
+          !creatorSold;
+        let tier: 'strict' | 'loose' | null = null;
+        if (passesStrict) tier = 'strict';
+        else if (loose && passesLoose) tier = 'loose';
+        if (tier === null) continue;
+        const stake = tier === 'strict' ? p.stakeLamports : p.looseStakeLamports;
+        const cap = state.maxBuyLamports(mint);
+        // Full stake or nothing: a partial buy below the stake is a
+        // different (smaller, fee-dominated) trade, not the sized one.
+        if (cap < stake) continue;
+        const amount = stake;
         if (amount <= 0n) continue;
         if (free < amount + txFee) continue;
-        // Scout's first dust leaves the coin a candidate (the top-up comes
-        // later); every other buy ends buying on that coin.
-        if (!(p.entry === 'scout' && already === 0n)) candidates.delete(mint);
-        orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: MAX_SLIPPAGE_BPS });
-        spent.set(mint, already + amount);
+        orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: p.buySlippageBps });
         bought.add(mint);
         free -= amount + txFee;
-        if (isNewSlot) slots -= 1;
+        slots -= 1;
       }
 
       return orders;
